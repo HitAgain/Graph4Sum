@@ -6,66 +6,55 @@ from ltp import LTP
 import numpy as np
 
 from tokenizer import Tokenizer
+from snippets import DataGenerator
+
+STARTTOKEN = 1
+ENDTOKEN = 2
 
 class Data(object):
-	"""数据处理类"""
+
 	def __init__(self, file_path, vocab_path, batch_size):
-		# 语法分析工具
+		# ltp
 		self.ltp_parse_ = LTP()
-		# 原始数据路径
+		# data path
 		self.file_path_ = file_path
-		# bert字典工具类
+		# bert_vocab
 		self.tokenizer_ = Tokenizer(vocab_path, do_lower_case=True)
-		# batch size
+		# batch_size
 		self.batch_size = batch_size
 
+	# data load
 	def load_data(self):
-	    src1, src2, src3, summary = list(), list(), list(), list()
+	    samples = []
 	    with open(self.file_path_, 'r', encoding='utf-8') as f_in:
 	        for line in f_in:
-	            splits = line.strip('\n').split('>>>')
+	            splits = line.strip('\n').split('\t')
 	            if len(splits) != 4:
 	            	print("find one error data just skip")
 	            else:
-	            	src1.append(splits[1])
-	            	src2.append(splits[2])
-	            	src3.append(splits[3])
-	            	summary.append(summary)
-	    assert len(src1) == len(src2) == len(src3) == len(summary)
-	    return src1, src2, src3, summary
-
-    def data_generator(self):
-        # 文本1/文本2/文本3/摘要
-	    a, b, c, d = self.load_data()
-	    x, y, z, s = [], [], [], []
-	    while True:
-	        for a_, b_, c_, d_ in zip(a, b, c, d):
-	            x.append(a_)
-	            y.append(b_)
-	            z.append(c_)
-	            s.append(d_)
-	            if len(x) == self.batch_size:
-	                x_ = batch_encode(x)
-	                y_ = batch_encode(y)
-	                z_ = batch_encode(z)
-	                s_ = batch_encode(s)
-	                yield [x_, y_, z_, s_], None
-	                x, y, z, s = [], [], [], []
-
-	def batch_encode(self, txt_list):
-	    txt_ids_list = []
-	    for txt in txt_list:
-	        txt_ids_list.append([1] + self.tokenizer_.encode(txt) + [2])
-	    txt_ids_list_padded = padding(txt_ids_list)
-	    return np.array(txt_ids_list_padded)
-
-	@ staticmethod
-	def padding(x):
-	    # padding至batch内的最大长度
-	    ml = max([len(i) for i in x])
-	    return [i + [0] * (ml-len(i)) for i in x]
+	              sent1_ids = [STARTTOKEN] + self.tokenizer_.encode(splits[0]) + [ENDTOKEN]
+	              sent2_ids = [STARTTOKEN] + self.tokenizer_.encode(splits[1]) + [ENDTOKEN]
+	              sent3_ids = [STARTTOKEN] + self.tokenizer_.encode(splits[2]) + [ENDTOKEN]
+	              sumry_ids = [STARTTOKEN] + self.tokenizer_.encode(splits[3]) + [ENDTOKEN]
+	              samples.append((sent1_ids, sent2_ids, sent3_ids, sumry_ids))
+	    return samples
 
 	@ staticmethod
 	def construct_sentence_graph(sentences):
-		pass
+		  pass
 
+class data_generator(DataGenerator):
+    def __iter__(self, random=False):
+      batch_sent_1, batch_sent_2, batch_sent_3, batch_summary = [], [], [], []
+      for is_end, (sent_1_id, sent_2_id, sent_3_id, summary_id) in self.sample(random):
+          batch_sent_1.append(sent_1_id)
+          batch_sent_2.append(sent_2_id)
+          batch_sent_3.append(sent_3_id)
+          batch_summary.append(summary_id)
+          if len(batch_sent_1) == self.batch_size or is_end:
+              batch_sent_1_padded = sequence_padding(batch_sent_1)
+              batch_sent_2_padded = sequence_padding(batch_sent_2)
+              batch_sent_3_padded = sequence_padding(batch_sent_3)
+              batch_summary_padded = sequence_padding(batch_summary)
+              yield [batch_sent_1_padded, batch_sent_2_padded, batch_sent_3_padded, batch_summary_padded], None
+              batch_sent_1, batch_sent_2, batch_sent_3, batch_summary = [], [], [], []

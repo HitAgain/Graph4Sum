@@ -86,5 +86,6 @@ class Graph4Sum(object):
         return graph_sum_model
 
 if __name__ == '__main__':
+    ## check model correction
     Graph4Sum = Graph4Sum()
     Graph4Sum.build()
