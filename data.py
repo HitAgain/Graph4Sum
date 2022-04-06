@@ -30,7 +30,7 @@ class Data(object):
 	        for line in f_in:
 	            splits = line.strip('\n').split('\t')
 	            if len(splits) != 4:
-	            	print("find one error data just skip")
+	              print("find one error data just skip")
 	            else:
 	              sent1_ids = [STARTTOKEN] + self.tokenizer_.encode(splits[0]) + [ENDTOKEN]
 	              sent2_ids = [STARTTOKEN] + self.tokenizer_.encode(splits[1]) + [ENDTOKEN]

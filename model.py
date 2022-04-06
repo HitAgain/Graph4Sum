@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 # @Author: HitAgain
 
+import os
+os.environ['TF_KERAS'] = '1'
+
 import numpy as np
 import tensorflow as tf
 
@@ -59,18 +62,30 @@ class Graph4Sum(object):
                     0),
                 'float32'))(tgt)
         # encoder
+         # shape = [bc_size, sent_nums, sent_length, emb_size]
         src_emb = keras.layers.TimeDistributed(SENT_EMB)(src)
+         # shape = [bc_size, sent_nums, emb_size]
         src_emb = keras.layers.TimeDistributed(keras.layers.LSTM(
             self.hidden_dim, return_state=False, return_sequences=False, dropout=0.5))(src_emb)
+         # shape = [bc_size, sent_nums, emb_size]
         decode_state = GCN_State([src_emb, graph])
+         # shape = [bc_size, emb_size]
         decode_state = MAX_pool(decode_state)
+         # shape = [bc_size, sent_nums, emb_size]
         decode_context = GCN_Context([src_emb, graph])
+         # shape = [bc_size, emb_size]
         decode_context = MAX_pool(decode_context)
+
         # decoder
+         # shape = [bc_size, sent_length, emb_size]
         dec_emb = keras.layers.Dropout(0.2)(SENT_EMB(tgt))
+         # shape = [bc_size, sent_length, emb_size]
         decoder_outputs = decoder_lstm(dec_emb, initial_state=[decode_state, decode_context])
+         # shape = [bc_size, sent_length, emb_size]
         final = keras.layers.Dense(128)(decoder_outputs)
+         # shape = [bc_size, sent_length, emb_size]
         final = keras.layers.LeakyReLU(0.2)(final)
+         # shape = [bc_size, sent_length, vocab_size]
         project = keras.layers.Dense(
             units=self.vocab_size,
             activation='softmax',
