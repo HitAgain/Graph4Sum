@@ -1,4 +1,4 @@
-e#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # @Author: jianlinsu
 # @Modify  HitAgain

@@ -5,6 +5,11 @@
 import os
 import logging
 
+import sys
+import codecs
+import json
+sys.stdout = codecs.getwriter("utf-8")(sys.stdout.detach())
+
 from pyltp import Segmentor, Postagger, Parser, NamedEntityRecognizer, SementicRoleLabeller
 
 class LtpParser(object):
@@ -30,6 +35,13 @@ class LtpParser(object):
         except Exception as e:
             logging.error("load parser model failed")
 
+        try:
+            self.srl = SementicRoleLabeller()
+            self.srl.load(os.path.join(self.model_dir, "pisrl.model"))
+            logging.info("load srl model success")
+        except Exception as e:
+            logging.error("load pisrl model failed")
+
 
     def forward(self, sentence):
         words = self.segmentor.segment(sentence)
@@ -42,3 +54,23 @@ class LtpParser(object):
         self.segmentor.release()
         self.postagger.release()
         self.parser.release()
+        self.srl.release()
+
+# pyltp测试函数
+def test():
+    ltp = LtpParser("/home/ltp_model_3.4.0")
+    print("ltp load success")
+    words, postags, arcs = ltp.forward('外交部回应世卫组织发布新冠病毒溯源报告')
+    print("\t".join("%d:%s" % (arc.head, arc.relation) for arc in arcs))
+    roles = ltp.srl.label(words, postags, arcs)  # 语义角色标注
+    res = []
+    word_ls = list(words)
+    for i in range(len(word_ls)):
+        res.append("{}:{}".format(i, word_ls[i]))
+    print(res)
+    # 打印结果
+    for role in roles:
+        print("{}:".format(role.index), "".join(["%s:(%d,%d)" % (arg.name, arg.range.start, arg.range.end) for arg in role.arguments]))
+
+if __name__ == '__main__':
+    test()
