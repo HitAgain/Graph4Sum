@@ -3,239 +3,178 @@
 # @Author: HitAgain
 
 import os
-os.environ['TF_KERAS'] = '1'
-import logging
-
 import numpy as np
-
-from config import Config as hp
-from backend import keras
-from backend import backend as K
-from backend import layers
-from backend import optimizers
-from util import add_dims, MultiHeadAttention, maxpool
+import tensorflow as tf
 from graph import GraphConv, GraphMaxPool
+from util import SearcherWrapper
 
-from data import Data,data_generator
+class BahdanauAttention(tf.keras.layers.Layer):
+    def __init__(self, units):
+        super(BahdanauAttention, self).__init__()
+        self.W1 = tf.keras.layers.Dense(units)
+        self.W2 = tf.keras.layers.Dense(units)
+        self.V = tf.keras.layers.Dense(1)
+
+    def call(self, query, values):
+        hidden_with_time_axis = tf.expand_dims(query, 1)
+        score = self.V(tf.nn.tanh(
+            self.W1(values) + self.W2(hidden_with_time_axis)))
+        attention_weights = tf.nn.softmax(score, axis=1)
+        context_vector = attention_weights * values
+        context_vector = tf.reduce_sum(context_vector, axis=1)
+        return context_vector, attention_weights
+
+class Encoder(tf.keras.layers.Layer):
+    def __init__(self, enc_hidden_dim, pretrain_weights):
+        """
+        enc_units:encoder hidden dim
+        pretrain_weights:pretrain c2v
+        """
+        super(Encoder, self).__init__()
+        self.enc_hidden_dim = enc_hidden_dim
+        self.pretrain_weights = pretrain_weights
+        if self.pretrain_weights:
+            self.vocab_size = np.shape(self.pretrain_weights)[0]
+            self.embedding_dim = np.shape(self.pretrain_weights)[1]
+            self.embedding = tf.keras.layers.Embedding(self.vocab_size,
+                                                       self.embedding_dim,
+                                                       weights = [self.pretrain_weights],
+                                                       trainable = False,
+                                                       mask_zero = True)
+        else:
+            self.vocab_size = 21128
+            self.embedding_dim = 128
+            self.embedding = tf.keras.layers.Embedding(self.vocab_size,
+                                                       self.embedding_dim,
+                                                       trainable = False,
+                                                       mask_zero = True)
+
+        self.gru = tf.keras.layers.GRU(self.enc_hidden_dim,
+                                       return_sequences=True,
+                                       return_state=True,
+                                       recurrent_initializer='glorot_uniform')
+
+    def call(self, x, hidden):
+        x = self.embedding(x)
+        output, state = self.gru(x, initial_state = hidden)
+        return output, state
+
+    def initialize_hidden_state(self, inp):
+        return tf.zeros((tf.shape(inp)[0], self.enc_hidden_dim))
+
+class Decoder(tf.keras.layers.Layer):
+    def __init__(self, dec_hidden_dim, pretrain_weights):
+        super(Decoder, self).__init__()
+        self.dec_hidden_dim = dec_hidden_dim
+        self.pretrain_weights = pretrain_weights
+        if self.pretrain_weights:
+            self.vocab_size = np.shape(self.pretrain_weights)[0]
+            self.embedding_dim = np.shape(self.pretrain_weights)[1]
+            self.embedding = tf.keras.layers.Embedding(self.vocab_size,
+                                                       self.embedding_dim,
+                                                       weights = [self.pretrain_weights],
+                                                       trainable = False,
+                                                       mask_zero = True)
+        else:
+            self.vocab_size = 21128
+            self.embedding_dim = 128
+            self.embedding = tf.keras.layers.Embedding(self.vocab_size,
+                                                       self.embedding_dim,
+                                                       trainable = False,
+                                                       mask_zero = True)
+
+        self.attention = BahdanauAttention(self.dec_hidden_dim)
+        self.gru = tf.keras.layers.GRU(self.dec_hidden_dim,
+                                       return_sequences=True,
+                                       return_state=True,
+                                       recurrent_initializer='glorot_uniform')
+        self.fc = tf.keras.layers.Dense(self.vocab_size)
 
 
-class Graph4Sum(object):
+    def call(self, x, hidden, enc_output):
+        context_vector, attention_weights = self.attention(hidden, enc_output)
+        x = self.embedding(x)
+        x = tf.concat([tf.expand_dims(context_vector, 1), x], axis=-1)
+        output, state = self.gru(x)
+        # shape = [bz, hidden_dim]
+        output = tf.reshape(output, (-1, output.shape[2]))
+        x = self.fc(output)
+        return x, state
 
-    def __init__(self):
-        # hidden_dim = 128
-        self.hidden_dim = hp.hidden_dim
-        self.vocab_size = hp.vocab_size
-        self.graph_dim = hp.graph_dim
+class GraphSeq2Seq(tf.keras.Model):
+    def __init__(self, enc_hidden_dim, dec_hidden_dim, graph_hidden_dim, pretrain_weights, end_token_idx=3):
+        super(GraphSeq2Seq, self).__init__()
+        self.end_token_idx = end_token_idx
+        self.encoder_1 = Encoder(enc_hidden_dim, pretrain_weights)
+        self.encoder_2 = Encoder(enc_hidden_dim, pretrain_weights)
+        self.encoder_3 = Encoder(enc_hidden_dim, pretrain_weights)
+        self.decoder = Decoder(dec_hidden_dim, pretrain_weights) 
+        self.gcn =  GraphConv(units = graph_hidden_dim)
 
-    # timedistribute + lstm may hit some shape error just abandon
-    # def build_timedistribute(self):
-    #     src = keras.layers.Input(shape=[None, None, ], dtype="int32", name="src_input_layer")
-    #     tgt = keras.layers.Input(shape=[None, ], dtype="int32", name="tgt_input_layer")
-    #     graph = keras.layers.Input(shape=[None, None, ], dtype="float32", name="graph_input_layer")
-    #     # layer
-    #     SENT_EMB = keras.layers.Embedding(self.vocab_size,
-    #                                       self.hidden_dim,
-    #                                       trainable=False,
-    #                                       mask_zero=True,
-    #                                       name='sent_emb_layer'
-    #     )
-    #     GCN_State = GraphConv(
-    #         units= self.graph_dim,
-    #         name='graph_conv_layer_1',
-    #     )
-    #     GCN_Context = GraphConv(
-    #         units= self.graph_dim,
-    #         name='graph_conv_layer_2',
-    #     )
-    #     MAX_pool = keras.layers.Lambda(
-    #         maxpool, name = "seq_pool_layer"
-    #     )
-    #     decoder_lstm = keras.layers.LSTM(
-    #         units=self.graph_dim,
-    #         return_state=False,
-    #         return_sequences=True,
-    #         name='decoder_lstm'
-    #     )
-    #     # for loss compute
-    #     out_mask = keras.layers.Lambda(
-    #         lambda x: K.cast(
-    #             K.greater(
-    #                 K.expand_dims(
-    #                     x,
-    #                     2),
-    #                 0),
-    #             'float32'))(tgt)
-    #     # encoder
-    #      # shape = [bc_size, sent_nums, sent_length, emb_size]
-    #     src_emb = keras.layers.TimeDistributed(SENT_EMB)(src)
-    #      # shape = [bc_size, sent_nums, emb_size]
-    #     src_emb = keras.layers.TimeDistributed(keras.layers.LSTM(
-    #         self.hidden_dim, return_state=False, return_sequences=False, dropout=0.5))(src_emb)
-    #      # shape = [bc_size, sent_nums, emb_size]
-    #     src_emb = tf.transpose(src_emb, perm=[1,0,2])
-    #     decode_state = GCN_State([src_emb, graph])
-    #      # shape = [bc_size, emb_size]
-    #     decode_state = MAX_pool(decode_state)
-    #      # shape = [bc_size, sent_nums, emb_size]
-    #     decode_context = GCN_Context([src_emb, graph])
-    #      # shape = [bc_size, emb_size]
-    #     decode_context = MAX_pool(decode_context)
+    def call(self, inputs, training=True):
+        #inp, tar = inputs
+        # 输入
+        inp1, inp2, inp3, graph, tar = inputs
 
-    #     # decoder
-    #      # shape = [bc_size, sent_length, emb_size]
-    #     dec_emb = keras.layers.Dropout(0.2)(SENT_EMB(tgt))
-    #      # shape = [bc_size, sent_length, emb_size]
-    #     decoder_outputs = decoder_lstm(dec_emb, initial_state=[decode_state, decode_context])
-    #      # shape = [bc_size, sent_length, emb_size]
-    #     final = keras.layers.Dense(128)(decoder_outputs)
-    #      # shape = [bc_size, sent_length, emb_size]
-    #     final = keras.layers.LeakyReLU(0.2)(final)
-    #      # shape = [bc_size, sent_length, vocab_size]
-    #     project = keras.layers.Dense(
-    #         units=self.vocab_size,
-    #         activation='softmax',
-    #         name='final_out')(final)
-    #     cross_entropy = K.sparse_categorical_crossentropy(
-    #         tgt[:, 1:], project[:, :-1])
-    #     cross_entropy = K.sum(
-    #         cross_entropy * out_mask[:, 1:, 0]) / K.sum(out_mask[:, 1:, 0])
-    #     graph_sum_model = keras.models.Model(
-    #         name="graph4sum", inputs=[src, tgt, graph], outputs=[project])
-    #     graph_sum_model.summary()
-    #     # add loss and compile
-    #     graph_sum_model.add_loss(cross_entropy)
-    #     graph_sum_model.compile(optimizer = optimizers.Adam(1e-3))
-    #     return graph_sum_model
+        enc_hidden_1 = self.encoder_1.initialize_hidden_state(inp1)
+        enc_output_1, enc_hidden_1 = self.encoder_1(inp1, enc_hidden_1)
 
-    def build(self):
-        src_1 = keras.layers.Input(shape=[None, ], dtype="int32", name="src_input_1")
-        src_2 = keras.layers.Input(shape=[None, ], dtype="int32", name="src_input_2")
-        src_3 = keras.layers.Input(shape=[None, ], dtype="int32", name="src_input_3")
-        tgt = keras.layers.Input(shape=[None, ], dtype="int32", name="tgt_input")
-        graph = keras.layers.Input(shape=[3, 3, ], dtype="float32", name="graph_input")
-        # layer
-        sent_emb = keras.layers.Embedding(self.vocab_size,
-                                          self.hidden_dim,
-                                          trainable=True,
-                                          mask_zero=True,
-                                          name='sent_emb_layer')
+        enc_hidden_2 = self.encoder_2.initialize_hidden_state(inp2)
+        enc_output_2, enc_hidden_2 = self.encoder_1(inp1, enc_hidden_2)
 
-        encoder_lstm_1 = keras.layers.LSTM(self.hidden_dim,
-                                           return_state=True,
-                                           return_sequences=True,
-                                           dropout=0.2,
-                                           name = 'encoder_1_layer')
+        enc_hidden_3 = self.encoder_3.initialize_hidden_state(inp3)
+        enc_output_3, enc_hidden_3 = self.encoder_1(inp1, enc_hidden_3)
 
-        encoder_lstm_2 = keras.layers.LSTM(self.hidden_dim,
-                                           return_state=True,
-                                           return_sequences=True,
-                                           dropout=0.2,
-                                           name = 'encoder_2_layer')
 
-        encoder_lstm_3 = keras.layers.LSTM(self.hidden_dim,
-                                           return_state=True,
-                                           return_sequences=True,
-                                           dropout=0.2,
-                                           name = 'encoder_3_layer')
-
-        GCN_State = GraphConv(
-            units= self.graph_dim,
-            name='graph_conv_state_layer',
+        enc_hidden_graph_input = tf.keras.layers.Concatenate(axis = -2)(
+                [tf.expand_dims(enc_hidden_1, axis=-2),
+                 tf.expand_dims(enc_hidden_2, axis=-2),
+                 tf.expand_dims(enc_hidden_3, axis=-2)]
         )
-        GCN_Context = GraphConv(
-            units= self.graph_dim,
-            name='graph_conv_context_layer',
+        enc_hidden_graph_output = self.gcn([enc_hidden_graph_input, graph])
+        dec_hidden = tf.math.reduce_max(enc_hidden_graph_output, axis = 1)
+        enc_output = tf.keras.layers.Concatenate(axis = -2)(
+                [enc_output_1,
+                 enc_output_2,
+                 enc_output_3]
         )
+        predict_tokens = list()
+        for t in range(0, tar.shape[1]):
+            dec_input = tf.dtypes.cast(tf.expand_dims(tar[:, t], 1), tf.float32) 
+            predictions, dec_hidden = self.decoder(dec_input, dec_hidden, enc_output)
+            predict_tokens.append(tf.dtypes.cast(predictions, tf.float32))
+        return tf.stack(predict_tokens, axis=1)
 
-        pool_layer = keras.layers.Lambda(
-            maxpool, name = "seq_pool"
+    def call_encoder(self, inp1, inp2, inp3, graph):
+
+        enc_hidden_1 = self.encoder_1.initialize_hidden_state(inp1)
+        enc_output_1, enc_hidden_1 = self.encoder_1(inp1, enc_hidden_1)
+
+        enc_hidden_2 = self.encoder_2.initialize_hidden_state(inp2)
+        enc_output_2, enc_hidden_2 = self.encoder_1(inp1, enc_hidden_2)
+
+        enc_hidden_3 = self.encoder_3.initialize_hidden_state(inp3)
+        enc_output_3, enc_hidden_3 = self.encoder_1(inp1, enc_hidden_3)
+
+        enc_hidden_graph_input = tf.keras.layers.Concatenate(axis = -2)(
+                [tf.expand_dims(enc_hidden_1, axis=-2),
+                 tf.expand_dims(enc_hidden_2, axis=-2),
+                 tf.expand_dims(enc_hidden_3, axis=-2)]
         )
-
-        ADD_DIMS = keras.layers.Lambda(
-            add_dims, name = "add_dims_layer")
-
-
-        decoder_lstm = keras.layers.LSTM(
-            units=self.graph_dim,
-            return_state=False,
-            return_sequences=True,
-            name='decoder_lstm_layer'
+        enc_hidden_graph_output = self.gcn([enc_hidden_graph_input, graph])
+        dec_hidden = tf.math.reduce_max(enc_hidden_graph_output, axis = 1)
+        enc_output = tf.keras.layers.Concatenate(axis = -2)(
+                [enc_output_1,
+                 enc_output_2,
+                 enc_output_3]
         )
-        # mask for loss compute
-        out_mask = keras.layers.Lambda(
-            lambda x: K.cast(
-                K.greater(
-                    K.expand_dims(
-                        x,
-                        2),
-                    0),
-                'float32'))(tgt)
+        return enc_output, dec_hidden
 
-        src_emb_1 = sent_emb(src_1)
-        src_emb_2 = sent_emb(src_2)
-        src_emb_3 = sent_emb(src_3)
-
-        _, src_context_1, src_state_1 = encoder_lstm_1(src_emb_1)
-        _, src_context_2, src_state_2 = encoder_lstm_2(src_emb_2)
-        _, src_context_3, src_state_3 = encoder_lstm_3(src_emb_3)
-
-        src_context_1_add_dims = ADD_DIMS(src_context_1)
-        src_context_2_add_dims = ADD_DIMS(src_context_2)
-        src_context_3_add_dims = ADD_DIMS(src_context_3)
-
-        src_state_1_add_dims = ADD_DIMS(src_state_1)
-        src_state_2_add_dims = ADD_DIMS(src_state_2)
-        src_state_3_add_dims = ADD_DIMS(src_state_3)
-
-        src_context_graph_input = keras.layers.Concatenate(axis = -2)([src_context_1_add_dims,
-                                                            src_context_2_add_dims,
-                                                            src_context_3_add_dims])
-        decode_context = GCN_Context([src_context_graph_input, graph])
-        decode_context_pool = pool_layer(decode_context)
-
-        src_state_graph_input = keras.layers.Concatenate(axis = -2)([src_state_1_add_dims,
-                                                          src_state_2_add_dims,
-                                                          src_state_3_add_dims])
-        decode_state = GCN_State([src_state_graph_input, graph])
-        decode_state_pool = pool_layer(decode_state)
-
-        dec_emb = sent_emb(tgt)
-        decoder_outputs = decoder_lstm(dec_emb, initial_state=[decode_state_pool, decode_context_pool])
-         # shape = [bc_size, sent_length, vocab_size]
-        project = keras.layers.Dense(
-            units=self.vocab_size,
-            activation='softmax',
-            name='final_out')(decoder_outputs)
-        cross_entropy = K.sparse_categorical_crossentropy(
-            tgt[:, 1:], project[:, :-1])
-        cross_entropy = K.sum(
-            cross_entropy * out_mask[:, 1:, 0]) / K.sum(out_mask[:, 1:, 0])
-        graph_sum_model = keras.models.Model(
-            name="graph4sum", inputs=[src_1, src_2, src_3, tgt, graph], outputs=[project])
-        graph_sum_model.summary()
-        # add loss and compile
-        graph_sum_model.add_loss(cross_entropy)
-        graph_sum_model.compile(optimizer = optimizers.Adam(1e-3))
-        return graph_sum_model
-
+    def call_docoder(self, dec_hidden, dec_input, enc_output):
+        predictions, dec_hidden = self.decoder.call(dec_input, dec_hidden, enc_output)
+        return predictions, dec_hidden, enc_output
 
 if __name__ == '__main__':
-    ## check model correction
-    Graph4Sum = Graph4Sum()
-    logging.debug("build model start")
-    model = Graph4Sum.build()
-    logging.debug("build model end")
-    data = Data("./data/train.txt", "/home/QuerySim/chinese_L-12_H-768_A-12/vocab.txt")
-    logging.debug("train data preparing start")
-    train_data = data.load_data()
-    logging.debug("data example:{}".format(train_data[:3]))
-    train_generator = data_generator(train_data, 16)
-    logging.debug("train data preparing end")
-    logging.info("start training")
-    model.fit_generator(
-        train_generator.forfit(),
-        steps_per_epoch=len(train_generator),
-        epochs=3,
-        verbose=1
-    )
-    logging.info("finish train")
+    gs2s = GraphSeq2Seq(128, 256, 256, None)
+    engine = SearcherWrapper(gs2s, 35, 2, 3, 0, 128, 256)
+    tf.saved_model.save(engine, "./Graph4SumServing", signatures = {"GreedyGenerate": engine.greedy_search})

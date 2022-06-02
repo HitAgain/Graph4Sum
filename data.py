@@ -66,4 +66,3 @@ class data_generator(DataGenerator):
               batch_graph_np =  np.asarray(batch_graph).astype('float32')
               yield [batch_sent_1_padded, batch_sent_2_padded, batch_sent_3_padded, batch_summary_padded, batch_graph_np], None
               batch_sent_1, batch_sent_2, batch_sent_3, batch_summary, batch_graph = [], [], [], [], []
-

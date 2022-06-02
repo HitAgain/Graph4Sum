@@ -1,101 +1,92 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # @Author:  HitAgain
-# @Date:  2021/1/29 16:21
+# inference module for serving
 
-from backend import backend as K
-from backend import keras
+
 import tensorflow as tf
 
-
-def add_dims(x):
-    y = K.expand_dims(x, axis=-2)
-    return y
-
-def maxpool(x):
-    return K.max(x, 1)
-
-def sequence_masking(x, mask, mode=0, axis=None):
-    """为序列条件mask的函数
-    mask: 形如(batch_size, seq_len)的0-1矩阵；
-    mode: 如果是0，则直接乘以mask；
-          如果是1，则在padding部分减去一个大正数。
-    axis: 序列所在轴，默认为1；
-    heads: 相当于batch这一维要被重复的次数。
-    """
-    if mask is None or mode not in [0, 1]:
-        return x
-    else:
-        if axis is None:
-            axis = 1
-        if axis == -1:
-            axis = K.ndim(x) - 1
-        assert axis > 0, 'axis muse be greater than 0'
-        for _ in range(axis - 1):
-            mask = K.expand_dims(mask, 1)
-        for _ in range(K.ndim(x) - K.ndim(mask) - axis + 1):
-            mask = K.expand_dims(mask, K.ndim(mask))
-        if mode == 0:
-            return x * mask
-        else:
-            return x - (1 - mask) * 1e12
-
-
-class MultiHeadAttention(keras.layers.Layer):
-    """多头注意力机制
-    """
+class SearcherWrapper(tf.Module):
+    """Provide search functions for seq2seq models"""
 
     def __init__(self,
-                 heads,
-                 head_size,
-                 key_size=None,
-                 kernel_initializer='glorot_uniform',
-                 **kwargs):
-        super(MultiHeadAttention, self).__init__(**kwargs)
-        self.heads = heads
-        self.head_size = head_size
-        self.out_dim = heads * head_size
-        self.key_size = key_size if key_size else head_size
-        self.kernel_initializer = keras.initializers.get(kernel_initializer)
-        self.supports_masking = True
-
-    def build(self, input_shape):
-        super(MultiHeadAttention, self).build(input_shape)
-        self.q_dense = keras.layers.Dense(units=self.key_size * self.heads,
-                                          kernel_initializer=self.kernel_initializer)
-        self.k_dense = keras.layers.Dense(units=self.key_size * self.heads,
-                                          kernel_initializer=self.kernel_initializer)
-        self.v_dense = keras.layers.Dense(units=self.out_dim,
-                                          kernel_initializer=self.kernel_initializer)
-        self.o_dense = keras.layers.Dense(units=self.out_dim,
-                                          kernel_initializer=self.kernel_initializer)
-
-    def call(self, inputs, mask=None):
-        """实现多头注意力
-        q_mask: 对输入的query序列的mask。
-                主要是将输出结果的padding部分置0。
-        v_mask: 对输入的value序列的mask。
-                主要是防止attention读取到padding信息。
-        a_mask: 对attention矩阵的mask。
-                不同的attention mask对应不同的应用。
+                 model: tf.keras.Model,
+                 max_sequence_length: int, 
+                 start_id: int, 
+                 end_id: int, 
+                 pad_id: int,
+                 enc_hidden_dim: int,
+                 dec_hidden_dim: int):
         """
-        q, k, v = inputs[:3]
-        # 处理mask
-        v_mask = K.cast(mask[0], "float32")
-        # 线性变换
-        qw = self.q_dense(q)
-        kw = self.k_dense(k)
-        vw = self.v_dense(v)
-        # 形状变换
-        qw = K.reshape(qw, (-1, K.shape(q)[1], self.heads, self.key_size))
-        kw = K.reshape(kw, (-1, K.shape(k)[1], self.heads, self.key_size))
-        vw = K.reshape(vw, (-1, K.shape(v)[1], self.heads, self.head_size))
-        # Attention
-        a = tf.einsum('bjhd,bkhd->bhjk', qw, kw) / self.key_size**0.5
-        a = sequence_masking(a, v_mask, 1, -1)
-        a = K.softmax(a)
-        # 完成输出
-        o = tf.einsum('bhjk,bkhd->bjhd', a, vw)
-        o = K.reshape(o, (-1, K.shape(o)[1], self.out_dim))
-        o = self.o_dense(o)
-        return o
+        :param model: seq2seq model instance.
+        :param max_sequence_length: max sequence length of decoded sequences.
+        :param start_id: bos id for decoding.
+        :param end_id: eos id for decoding.
+        :param pad_id: when a sequence is shorter thans other sentences, the back token ids of the sequence is filled pad id.
+        """
+        self.model = model
+        self.max_sequence_length = max_sequence_length
+        self.start_id = start_id
+        self.end_id = end_id
+        self.pad_id = pad_id
+        self.enc_hidden_dim = enc_hidden_dim
+        self.dec_hidden_dim = dec_hidden_dim
+
+    ## Greedy Search
+    ## @tf.function(input_signature=[tf.TensorSpec([None, None], tf.int32)])
+    @tf.function(input_signature = [tf.TensorSpec([None, None], tf.int32, name='inp1'),
+                                    tf.TensorSpec([None, None], tf.int32, name='inp2'),
+                                    tf.TensorSpec([None, None], tf.int32, name='inp3'),
+                                    tf.TensorSpec([None, 3, 3], tf.float32, name='graph')])
+    def greedy_search(self,
+                      encoder_inp_1: tf.int32,
+                      encoder_inp_2: tf.int32,
+                      encoder_inp_3: tf.int32,
+                      encoder_inp_graph: tf.float32) -> tf.Tensor:
+        """
+        Generate sentences using decoder by beam searching.
+        :param encoder_input: seq2seq model inputs [BatchSize, EncoderSequenceLength].
+        :return: generated tensor shaped. and ppl value of each generated sentences
+        """
+        batch_size = tf.shape(encoder_inp_1)[0]
+        # encoder_output and dec_hidden_state precomputed
+        enc_output, dec_hidden = self.model.call_encoder(encoder_inp_1, encoder_inp_2, encoder_inp_3, encoder_inp_graph)
+        decoder_final_res = tf.fill([batch_size, 1], self.start_id)
+        cur_dec_input = tf.fill([batch_size, 1], self.start_id)
+        log_perplexity = tf.fill([batch_size, 1], 0.0)
+        sequence_lengths = tf.fill([batch_size, 1], self.max_sequence_length)
+        is_ended = tf.zeros([batch_size, 1], tf.bool)
+
+        def _cond(enc_output, dec_hidden, decoder_final_res, cur_dec_input, is_ended, log_perplexity, sequence_lengths):
+            return tf.shape(decoder_final_res)[1] < self.max_sequence_length and not tf.reduce_all(is_ended)
+
+        def _body(enc_output, dec_hidden, decoder_final_res, cur_dec_input, is_ended, log_perplexity, sequence_lengths):
+            # [BatchSize, VocabSize]
+            predictions, dec_hidden, enc_output = self.model.call_docoder(dec_hidden, cur_dec_input, enc_output)
+            output = predictions
+            #output = tf.nn.log_softmax(output, axis=1)
+            log_probs, new_tokens = tf.math.top_k(output)
+            log_probs, new_tokens = tf.cast(log_probs, log_perplexity.dtype), tf.cast(new_tokens, tf.int32)
+            log_perplexity = tf.where(is_ended, log_perplexity, log_perplexity + log_probs)
+            new_tokens = tf.where(is_ended, self.pad_id, new_tokens)
+            is_ended = tf.logical_or(is_ended, new_tokens == self.end_id)
+            sequence_lengths = tf.where(new_tokens == self.end_id, tf.shape(decoder_final_res)[1] + 1, sequence_lengths)
+            decoder_final_res = tf.concat((decoder_final_res, new_tokens), axis=1)
+            cur_dec_input = new_tokens
+            return enc_output, dec_hidden, decoder_final_res, cur_dec_input, is_ended, log_perplexity, sequence_lengths
+
+        enc_output, dec_hidden, decoder_final_res, cur_dec_input, is_ended, log_perplexity, sequence_lengths = tf.while_loop(
+            _cond,
+            _body,
+            [enc_output, dec_hidden, decoder_final_res, cur_dec_input, is_ended, log_perplexity, sequence_lengths],
+            shape_invariants=[
+                tf.TensorSpec([None, None, self.enc_hidden_dim], tf.float32),
+                tf.TensorSpec([None, self.dec_hidden_dim], tf.float32),
+                tf.TensorSpec([None, None], tf.int32),
+                tf.TensorSpec([None, 1], tf.int32),
+                tf.TensorSpec(is_ended.get_shape(), is_ended.dtype),
+                tf.TensorSpec(log_perplexity.get_shape(), log_perplexity.dtype),
+                tf.TensorSpec(sequence_lengths.get_shape(), sequence_lengths.dtype),
+            ],
+        )
+        return decoder_final_res
